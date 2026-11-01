@@ -96,7 +96,11 @@ def build_inheritance_graph(root_path: str, ignore_patterns: List[str] = []) -> 
     graph: Dict[str, List[str]] = {}
     spec = None
     if ignore_patterns:
-        spec = pathspec.PathSpec.from_glob(ignore_patterns)
+        if pathspec is None:
+            raise RuntimeError("Ignore patterns were given but the pathspec package is not installed.")
+        # from_lines with the git wildmatch pattern class is the
+        # documented PathSpec constructor surface.
+        spec = pathspec.PathSpec.from_lines("gitwildmatch", ignore_patterns)
 
     for root, dirs, files in os.walk(root_path):
         if spec and spec.match_file(root):
@@ -115,7 +119,17 @@ def build_inheritance_graph(root_path: str, ignore_patterns: List[str] = []) -> 
 def find_vulnerable_paths(graph: Dict[str, List[str]]) -> List[Tuple[str, str]]:
     """
     Identifies paths with potentially vulnerable permission inheritance.
-    This is a placeholder and should be customized for specific vulnerability criteria.
+
+    A child is flagged when it grants a read, write, or execute bit to a
+    class (owner, group, or other) that its parent does not grant to
+    that class or to any wider class (other is wider than group, and
+    group is wider than owner). The comparison is on permission bits,
+    not on numeric mode values: numeric order weights owner bits above
+    group and other bits, so a child at 0o077 under a parent at 0o400
+    scores lower numerically while granting kinds of access the parent
+    grants to nobody, and a child at 0o400 under a parent at 0o077
+    scores higher numerically while granting only owner read, a kind
+    the parent already grants to the wider group and other classes.
 
     Args:
         graph (Dict[str, List[str]]): The permission inheritance graph.
@@ -137,9 +151,21 @@ def find_vulnerable_paths(graph: Dict[str, List[str]]) -> List[Tuple[str, str]]:
                 child_permissions = get_permissions(child)
             except OSError:
                 continue
-            # Example vulnerability check: Child has more permissive permissions than parent
-            if child_permissions["octal"] > parent_permissions["octal"]:
-                vulnerable_paths.append((child, f"Child has more permissive permissions ({oct(child_permissions['octal'])}) than parent ({oct(parent_permissions['octal'])})"))
+            child_mode = child_permissions["octal"]
+            parent_mode = parent_permissions["octal"]
+            # Per class, the parent coverage is the bits the parent grants
+            # to that class or to any wider class: owner is covered by
+            # owner, group, and other; group by group and other; other
+            # only by other.
+            extra = 0
+            for shift in (6, 3, 0):
+                child_class = (child_mode >> shift) & 0o7
+                parent_coverage = 0
+                for cov_shift in range(shift, -1, -3):
+                    parent_coverage |= (parent_mode >> cov_shift) & 0o7
+                extra |= (child_class & ~parent_coverage) << shift
+            if extra:
+                vulnerable_paths.append((child, f"Child grants permission bits its parent does not grant to that class or any wider class ({oct(child_mode)} vs parent {oct(parent_mode)}; extra bits {oct(extra)})"))
 
     return vulnerable_paths
 
@@ -173,6 +199,7 @@ def output_results(vulnerable_paths: List[Tuple[str, str]], output_file: str = N
 
     except Exception as e:
         logging.error(f"Error outputting results: {e}")
+        raise
     finally:
         if output_file is not None:
             output_stream.close()
@@ -198,9 +225,23 @@ def main():
         logging.error(f"Path '{root_path}' does not exist.")
         sys.exit(1)
 
+    # The output file may not overwrite a file inside the scanned tree.
+    if output_file:
+        resolved_root = os.path.realpath(root_path)
+        resolved_output = os.path.realpath(output_file)
+        if resolved_output == resolved_root or resolved_output.startswith(resolved_root + os.sep):
+            logging.error(f"Output path '{output_file}' is inside the scanned tree '{root_path}'; refusing to overwrite a scanned file.")
+            sys.exit(1)
+
     try:
         logging.info(f"Building inheritance graph for {root_path}...")
         graph = build_inheritance_graph(root_path, ignore_patterns)
+
+        # A plain file root and an empty directory hold no inheritance
+        # relationship at all, so there is nothing to report as scanned.
+        if not any(graph.values()):
+            logging.error(f"No entries were found under '{root_path}'; nothing was scanned.")
+            sys.exit(1)
 
         logging.info("Finding vulnerable paths...")
         vulnerable_paths = find_vulnerable_paths(graph)
