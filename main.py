@@ -107,6 +107,10 @@ def build_inheritance_graph(root_path: str, ignore_patterns: List[str] = []) -> 
             dirs[:] = [] # Modify dirs in-place to prevent recursion
             continue
 
+        # An ignored directory is still listed as a child of its parent by
+        # the parent loop, it just gets no entry of its own when the walk
+        # reaches it. find_vulnerable_paths then stats it as a child like
+        # any other, so ignoring a path hides its subtree, not itself.
         graph[root] = []
         for name in dirs + files:
             full_path = os.path.join(root, name)
@@ -158,6 +162,10 @@ def find_vulnerable_paths(graph: Dict[str, List[str]]) -> List[Tuple[str, str]]:
             # owner, group, and other; group by group and other; other
             # only by other.
             extra = 0
+            # Masking each class to three bits drops the special bits entirely.
+            # A child that adds setuid over its parent is invisible to this test,
+            # because S_IMODE carried the bit in and the shift and mask throw
+            # it away.
             for shift in (6, 3, 0):
                 child_class = (child_mode >> shift) & 0o7
                 parent_coverage = 0
@@ -180,6 +188,10 @@ def output_results(vulnerable_paths: List[Tuple[str, str]], output_file: str = N
         use_rich (bool, optional): Whether to use rich formatting for output. Defaults to True if rich is installed.
     """
 
+    # The output file is opened before the try, so an unwritable path
+    # raises out of this function into main instead of hitting the error
+    # logging inside it. The finally below closes only real files; I
+    # never close stdout.
     output_stream = sys.stdout if output_file is None else open(output_file, "w")
 
     try:
@@ -235,6 +247,9 @@ def main():
 
     try:
         logging.info(f"Building inheritance graph for {root_path}...")
+        # os.walk does not follow directory symlinks, so a tree reached only
+        # through a link is not in the graph at all. Nothing in the output
+        # records that the link was skipped.
         graph = build_inheritance_graph(root_path, ignore_patterns)
 
         # A plain file root and an empty directory hold no inheritance
